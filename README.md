@@ -102,6 +102,46 @@ python3 -I tests/fuzz_sync.py         # 随机同步模糊测试
 
 详见 [docs/offline-sync.md](docs/offline-sync.md)。
 
+## 展示次数对账（旧词包实际承担了多少术语展示）
+
+`termdb/ledger.py` 在术语库**旁边**增加一个可重开、可补正的本地计数对账库，
+用来回答“仍在使用的旧词包实际承担了多少次术语展示”，再决定是否催促换版。
+它只落在本地 SQLite，不接网络、不连页面；安装身份可直接从现有
+`ScreenDevice` 的本地词包读取，发布端已淘汰该版本也照常识别。
+
+- **安装记录**以 `(逻辑屏幕, 时刻)` 为键，内容是当时生效的完整词包身份
+  `(频道, 版本号, 包摘要)`、明确的“身份未知”，或撤销；它是安装事实，不是
+  下发通知。
+- **读数**以 `(屏幕, 计数轮次, 设施/语种/语境, 时刻)` 为键，是非负整数累计
+  次数；换轮次即计数器重启，换播放器或频道不自动重启。
+- 每个键只取最高修订；较低修订忽略，同最高修订内容冲突则**拒收整批**，
+  重送无副作用；更高修订可撤销，并记住修订号防止旧值复活。
+- 相邻有效读数 `(a,x)`、`(b,y)` 给出 `[a,b)` 的 `y-x` 次展示；首条只作基线，
+  末条之后不估算。全程同一词包才归给它；只要有未知时段就是
+  `identity_unknown`，全程可识别但换过包（含换回）就是 `cross_version`。
+- 报表按右端读数时间范围 `[起点, 终点)` 选取、不按时长拆分，给出可归属次数
+  （按屏幕/三元组/完整身份）、不可归属次数（按屏幕/三元组/原因）与逐笔非零
+  增量，且只读取同一次已提交状态。
+- 补报是增量的：读数更正只影响相邻区间，安装更正只影响本屏幕与生效状态变化
+  相交的区间（含两端在外、中途穿过的区间）；报表不重读原始遥测。
+
+```python
+from termdb import CountLedger, LedgerBatch, InstallRecord, Reading
+
+ledger = CountLedger.open("counts.db")
+ledger.apply(LedgerBatch(
+    installs=[InstallRecord.installed("lobby", 0, 1, ("north", 3, "pack"))],
+    readings=[
+        Reading.cumulative("lobby", "r1", "pump-hall", "en", "tech", 10, 1, 0),
+        Reading.cumulative("lobby", "r1", "pump-hall", "en", "tech", 20, 1, 37),
+    ],
+))
+print(ledger.report(0, 2 ** 62))
+```
+
+详见 [docs/display-accounting.md](docs/display-accounting.md)，或用
+`python3 -I demo/ledger_demo.py` 看“迟到记录改变历史归属”的可复现示例。
+
 ## 目录
 
 ```
@@ -110,25 +150,32 @@ termdb/
   engine.py   从零判定引擎（无缓存依赖，先资格后最高级出处）
   store.py    SQLite 存储：原子批次、局部重算、台账、重开
   sync.py     离线词包：发布端快照、分页下载、差量、设备原子安装
+  ledger.py   展示次数对账：修订合并、区间归属、增量维护、报表
 tests/
   oracle.py          独立从零重写的参考判定器（不导入 engine）
   test_termdb.py     17 个端到端/边界/回归测试
   fuzz_scopes.py     随机差分模糊：每批后全量对照 oracle 并核对重算范围
   test_sync.py       42 个离线同步端到端测试
   fuzz_sync.py       10 种子 × 60 轮随机同步模糊
+  test_ledger.py     33 个对账库端到端/边界/回归测试
+  fuzz_ledger.py     12 种子 × 120 轮随机对账，全量对照独立重算
 demo/demo.py         可运行的小参考，串联题目点名的五类核对
 demo/sync_demo.py    可复现的离线词包同步示例
+demo/ledger_demo.py  可复现的迟到记录改变历史归属示例
 docs/offline-sync.md 离线同步协议、本地使用方式与可复现示例
+docs/display-accounting.md 对账库规则、增量维护、使用方式与示例
 ```
 
 ## 运行
 
 ```bash
-python3 -I -m unittest discover -s tests -v   # 59 个测试
+python3 -I -m unittest discover -s tests -v   # 92 个测试
 python3 -I tests/fuzz_scopes.py              # 12 种子 × 400 随机批次
 python3 -I tests/fuzz_sync.py                # 10 种子 × 60 随机同步轮
+python3 -I tests/fuzz_ledger.py              # 12 种子 × 120 随机对账轮
 python3 -I demo/demo.py                      # 端到端小参考
 python3 -I demo/sync_demo.py                 # 离线词包同步示例
+python3 -I demo/ledger_demo.py               # 迟到记录改变归属示例
 ```
 
 ## 持久化与重开
