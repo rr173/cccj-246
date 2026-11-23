@@ -216,6 +216,21 @@ class TermStore:
     def close(self) -> None:
         self._conn.close()
 
+    @property
+    def state_seq(self) -> int:
+        """Monotonic commit token for the current committed state.
+
+        Accepted and rejected batches both advance the ledger, so this is a
+        *state observation* token rather than a content hash.  A publisher
+        reads every manifest coordinate while holding one store instance and
+        records the token alongside the version it produces.
+        """
+        return self._seq
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._conn.in_transaction
+
     # ------------------------------------------------------------- indexing
 
     def _load_candidates(self, candidate_lists: dict) -> None:

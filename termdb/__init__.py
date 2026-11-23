@@ -24,6 +24,14 @@ from .model import (
     WITHDRAWN,
 )
 from .store import TermStore
+from .sync import (
+    KEEP_VERSIONS,
+    PAGE_LIMIT,
+    OfflinePublisher,
+    RenegotiateError,
+    ScreenDevice,
+    SyncError,
+)
 
 __all__ = [
     "BODY_STATES",
@@ -38,13 +46,19 @@ __all__ = [
     "EntryKey",
     "EXPLICIT_CLEAR",
     "GENERIC",
+    "KEEP_VERSIONS",
     "NO_AVAILABLE",
+    "OfflinePublisher",
+    "PAGE_LIMIT",
     "Policy",
     "PolicyCorrection",
     "REVIEWED",
     "REVIEW_STATES",
     "REVOKED",
+    "RenegotiateError",
     "SUPPLIED",
+    "ScreenDevice",
+    "SyncError",
     "TEXT",
     "TermStore",
     "WITHDRAWN",

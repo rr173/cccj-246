@@ -52,6 +52,56 @@
 - 此前缺失或被政策挡住的高优先级候选，在修订后会被重新判定并可能成为赢家。
 - 每次重算都有计数（`recompute_stat`），测试据此断言重算范围精确。
 
+## 离线词包同步（断网可读、续传、整包校验）
+
+屏幕有时只能短暂联网。`termdb/sync.py` 在术语库之上增加离线词包：发布端
+用本地接口模拟，设备把词包和下载日志落在本地目录；断网时继续读最后一份
+完整安装的词包，重连后接着同一次下载，全部页校验通过才原子替换。
+
+```python
+from termdb import OfflinePublisher, ScreenDevice, TermStore
+
+store = TermStore.open("terms.db")
+pub = OfflinePublisher("publisher.db", store)
+pub.publish("north-wing", [
+    ("pump-hall", "en", "tech"),
+    ("pump-hall", "zh", "tech"),
+    ("gate", "zh", "tech"),
+])
+
+dev = ScreenDevice.open("screen-state", "north-wing", pub)
+manifest = dev.sync()                      # none / full / delta
+if manifest["mode"] != "none":
+    for n in range(manifest["page_count"]):
+        dev.accept_page(pub.fetch_page(manifest["download"], n))
+    dev.install(manifest["download"])
+print(dev.lookup("pump-hall", "en/tech"))  # 断网也可读
+```
+
+要点：
+
+- 发布清单是 `(设施, 语种, 语境)` 三元组**集合**；同一次成功发布读取
+  术语库的**同一个已提交状态**，每频道生成下一个版本号。未知坐标拒绝
+  发布；当前不供数的坐标不进版本；只下发显示文字，不含出处/审核/证据。
+- 更正术语不改写已发布版本；失败的发布不改变频道与既有版本的保留范围。
+  每频道只保留最近 3 个成功版本。
+- 差量只含净变化：文字新增/改变写入，原先有文字而现在不供数或退出清单
+  的坐标删除；同文换源不传；净变化为空也能切到目标版本。
+- 每页最多 128 条；同一次下载的频道/基版/目标/页数/页内容固定，重开
+  发布端或出现新版本都不会让原页变成新内容。所需版本已淘汰时明确要求
+  重新协商，绝不拼接不同下载的页。
+- 设备重开可续传且不重取已收页；缺页、损坏、夹入其他下载的页、同页号
+  内容相悖都拒绝安装。每页有哈希、整包有摘要，并提供可核对的 pack id。
+- 安装为单文件原子替换：中断不会暴露半套写入/删除；差量必须基版精确
+  匹配；迟到下载不回退；重复安装同一词包是 no-op。
+
+```bash
+python3 -I demo/sync_demo.py          # 可复现的端到端离线同步示例
+python3 -I tests/fuzz_sync.py         # 随机同步模糊测试
+```
+
+详见 [docs/offline-sync.md](docs/offline-sync.md)。
+
 ## 目录
 
 ```
@@ -59,19 +109,26 @@ termdb/
   model.py    领域模型与常量（词条身份、三态、政策、批次）
   engine.py   从零判定引擎（无缓存依赖，先资格后最高级出处）
   store.py    SQLite 存储：原子批次、局部重算、台账、重开
+  sync.py     离线词包：发布端快照、分页下载、差量、设备原子安装
 tests/
   oracle.py          独立从零重写的参考判定器（不导入 engine）
   test_termdb.py     17 个端到端/边界/回归测试
   fuzz_scopes.py     随机差分模糊：每批后全量对照 oracle 并核对重算范围
-demo/demo.py        可运行的小参考，串联题目点名的五类核对
+  test_sync.py       42 个离线同步端到端测试
+  fuzz_sync.py       10 种子 × 60 轮随机同步模糊
+demo/demo.py         可运行的小参考，串联题目点名的五类核对
+demo/sync_demo.py    可复现的离线词包同步示例
+docs/offline-sync.md 离线同步协议、本地使用方式与可复现示例
 ```
 
 ## 运行
 
 ```bash
-python3 -I -m unittest discover -s tests -v   # 17 个测试
+python3 -I -m unittest discover -s tests -v   # 59 个测试
 python3 -I tests/fuzz_scopes.py              # 12 种子 × 400 随机批次
+python3 -I tests/fuzz_sync.py                # 10 种子 × 60 随机同步轮
 python3 -I demo/demo.py                      # 端到端小参考
+python3 -I demo/sync_demo.py                 # 离线词包同步示例
 ```
 
 ## 持久化与重开
