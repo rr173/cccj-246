@@ -21,6 +21,19 @@ import sqlite3
 from datetime import datetime, timezone
 
 from .engine import resolve
+from .review import (
+    DRAFT_MERGED,
+    DRAFT_SAVED,
+    DraftAlreadyMerged,
+    DraftError,
+    DraftNotFound,
+    MergeConflict,
+    entry_value,
+    expected_supply,
+    merge_value,
+    policy_value,
+    supply_signature,
+)
 from .model import (
     BODY_STATES,
     Batch,
@@ -87,6 +100,56 @@ CREATE TABLE recompute_stat (
 );
 """
 
+#: Review tables are also created by ``open`` so databases made before this
+#: feature existed can still save and approve drafts.
+REVIEW_SCHEMA = """
+CREATE TABLE IF NOT EXISTS review_draft (
+    draft_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at   TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    merged_at    TEXT,
+    merged_seq   INTEGER,
+    batch_detail TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS review_draft_entry (
+    draft_id    INTEGER NOT NULL,
+    facility    TEXT NOT NULL,
+    lang        TEXT NOT NULL,
+    ctx         TEXT NOT NULL,
+    source_id   TEXT NOT NULL,
+    base_value  TEXT,
+    draft_value TEXT NOT NULL,
+    PRIMARY KEY (draft_id, facility, lang, ctx, source_id)
+);
+CREATE TABLE IF NOT EXISTS review_draft_policy (
+    draft_id    INTEGER PRIMARY KEY,
+    facility    TEXT NOT NULL,
+    base_value  TEXT NOT NULL,
+    draft_value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS review_draft_target (
+    draft_id     INTEGER NOT NULL,
+    facility     TEXT NOT NULL,
+    target_key   TEXT NOT NULL,
+    base_result  TEXT NOT NULL,
+    draft_result TEXT NOT NULL,
+    PRIMARY KEY (draft_id, facility, target_key)
+);
+"""
+
+
+def _draft_signature(snapshot, facility, target, base_sig):
+    """Baseline and draft supply signatures recorded for one target.
+
+    Targets the draft's scope never touched have no recorded draft result;
+    both sides then trivially equal the live baseline signature.
+    """
+
+    for item in snapshot["targets"]:
+        if item["facility"] == facility and item["target"] == target.key():
+            return item["base_result"], item["draft_result"]
+    return base_sig, base_sig
+
 
 class TermStore:
     def __init__(self, path: str, conn: sqlite3.Connection):
@@ -100,6 +163,10 @@ class TermStore:
         self._reverse: dict[Coord, set[Coord]] = {}
         self._universe: set[Coord] = set()
         self._seq = 0
+        # Token of the live state this instance last loaded/wrote; used to
+        # notice a correction committed by another connection on the same
+        # file before we write our own.
+        self._token = None
 
     # ------------------------------------------------------------------ open
 
@@ -117,6 +184,7 @@ class TermStore:
         conn.execute("BEGIN")
         try:
             conn.executescript(SCHEMA)
+            conn.executescript(REVIEW_SCHEMA)
             store = cls(path, conn)
             store._load_candidates(candidate_lists)
             for policy in policies.values():
@@ -129,6 +197,9 @@ class TermStore:
             conn.execute(
                 "INSERT INTO meta VALUES ('created_at', ?)",
                 (datetime.now(timezone.utc).isoformat(),),
+            )
+            conn.execute(
+                "INSERT INTO meta VALUES ('state_counter', '0')"
             )
             store._build_initial_cache()
             conn.execute(
@@ -151,6 +222,7 @@ class TermStore:
     def open(cls, path: str) -> "TermStore":
         conn = sqlite3.connect(path, isolation_level=None)
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(REVIEW_SCHEMA)
         store = cls(path, conn)
 
         rows = conn.execute(
@@ -210,7 +282,12 @@ class TermStore:
         store._seq = conn.execute(
             "SELECT COALESCE(MAX(seq), 0) FROM batch_ledger"
         ).fetchone()[0]
+        if conn.execute(
+            "SELECT 1 FROM meta WHERE key = 'state_counter'"
+        ).fetchone() is None:
+            conn.execute("INSERT INTO meta VALUES ('state_counter', '0')")
         store._rebuild_indexes()
+        store._token = store._state_counter()
         return store
 
     def close(self) -> None:
@@ -329,44 +406,68 @@ class TermStore:
     # ---------------------------------------------------------------- batches
 
     def apply_batch(self, batch: Batch) -> int:
-        seq = self._seq + 1
         detail = self._batch_detail(batch)
-        try:
-            plan, scope = self._validate(batch)
-        except BatchError as exc:
-            self._record_batch(seq, "rejected", detail, str(exc))
-            self._seq = seq
-            raise
+        while True:
+            self._ensure_fresh()
+            seq = self._seq + 1
+            try:
+                plan, scope = self._validate(batch)
+            except BatchError as exc:
+                self._record_batch(seq, "rejected", detail, str(exc))
+                self._seq = seq
+                raise
 
-        conn = self._conn
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            for entry in plan:
-                self._write_entry(entry)
-                self.entries[self._ekey(entry)] = entry
-            if batch.policy is not None:
-                pc = batch.policy
-                policy = Policy(
-                    facility=pc.facility,
-                    allow_generic=pc.allow_generic,
-                    require_public_reviewed=pc.require_public_reviewed,
-                    blocked=pc.blocked,
-                )
-                self._write_policy(policy)
-                self.policies[pc.facility] = policy
-
-            for facility, target in sorted(
-                scope, key=lambda ft: (ft[0], ft[1].key())
-            ):
-                self._recompute_one(facility, target, count=True)
-
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+            conn = self._conn
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # A correction committed by another connection after this
+                # batch was validated would be overwritten by the stale
+                # plan; reload and revalidate instead.
+                if self._state_counter() != self._token:
+                    conn.rollback()
+                    self._reload_live_state()
+                    continue
+                self._apply_in_transaction(plan, batch.policy, scope)
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            self._token = self._state_counter()
+            break
         self._record_batch(seq, "accepted", detail, "")
         self._seq = seq
         return seq
+
+    def _apply_in_transaction(self, plan, policy_correction, scope) -> None:
+        """Write an already-validated plan; the caller owns the transaction.
+
+        Also advances the persistent state counter in the same transaction,
+        which is how other connections notice that live wording moved.
+        """
+
+        for entry in plan:
+            self._write_entry(entry)
+            self.entries[self._ekey(entry)] = entry
+        if policy_correction is not None:
+            pc = policy_correction
+            policy = Policy(
+                facility=pc.facility,
+                allow_generic=pc.allow_generic,
+                require_public_reviewed=pc.require_public_reviewed,
+                blocked=pc.blocked,
+            )
+            self._write_policy(policy)
+            self.policies[pc.facility] = policy
+
+        for facility, target in sorted(
+            scope, key=lambda ft: (ft[0], ft[1].key())
+        ):
+            self._recompute_one(facility, target, count=True)
+        self._conn.execute(
+            "UPDATE meta SET value = CAST(value AS INTEGER) + 1 "
+            "WHERE key = 'state_counter'"
+        )
 
     def _validate(self, batch: Batch):
         if not batch.entry_corrections and batch.policy is None:
@@ -541,6 +642,688 @@ class TermStore:
                 scope.add((facility, target))
         return scope
 
+    # ------------------------------------------------------- review drafts
+
+    def _actual_changes(self, plan):
+        """Keep only records whose complete value really moved from live."""
+
+        return [
+            entry for entry in plan
+            if entry_value(entry) != entry_value(
+                self.entries.get(self._ekey(entry))
+            )
+        ]
+
+    def _prepare_draft(self, batch: Batch):
+        """Validate a batch and snapshot its net effect against live state.
+
+        Returns ``(plan, policy_change, scope)``.  ``save_draft`` uses this
+        while observing one committed baseline; approval later reuses the
+        stored snapshot, never these commands.
+        """
+
+        try:
+            plan, _ = self._validate(batch)
+        except BatchError as exc:
+            raise DraftError(f"invalid correction batch: {exc}") from None
+
+        # Only *actual* changes form the draft: a correction line whose net
+        # effect equals the baseline changes nothing and must not later be
+        # reported as either a draft edit or a supply hazard.
+        plan = self._actual_changes(plan)
+
+        policy_change = None
+        if batch.policy is not None:
+            pc = batch.policy
+            live_policy = self.policies[pc.facility]
+            before = policy_value(live_policy)
+            after = policy_value(Policy(
+                facility=pc.facility,
+                allow_generic=pc.allow_generic,
+                require_public_reviewed=pc.require_public_reviewed,
+                blocked=pc.blocked,
+            ))
+            if before != after:
+                policy_change = (pc.facility, before, after)
+
+        if policy_change is None and not plan:
+            raise DraftError("batch changes nothing relative to the baseline")
+
+        # The review scope is wider than the direct-recompute scope: a
+        # generic change can affect facilities the baseline policy currently
+        # forbids from using generic words, because approval happens later.
+        scope = self._review_targets(
+            [(entry.facility, entry.coord) for entry in plan],
+            policy_change[0] if policy_change is not None else None,
+        )
+        return plan, policy_change, scope
+
+    def save_draft(self, batch: Batch) -> int:
+        """Validate ``batch`` like a direct correction and snapshot a draft.
+
+        Nothing is written to the live word supply: the draft only records
+        the batch's net effect on the *current committed baseline*, the
+        complete value of every record it changes, an optional changed
+        policy, and every affected target's baseline/draft supply result.
+        The returned draft id is immutable from now on and survives reopen.
+        """
+
+        while True:
+            self._ensure_fresh()
+            observed = self._token
+            plan, policy_change, scope = self._prepare_draft(batch)
+
+            base_signatures = {
+                (fac, target.key()): supply_signature(self.query(fac, target))
+                for fac, target in scope
+            }
+
+            # Apply the plan as a small override map over live state, then
+            # resolve affected targets against that hypothetical state.  The
+            # unchanged entry table is never copied.
+            overrides = {self._ekey(entry): entry for entry in plan}
+            patched_policies = None
+            if policy_change is not None:
+                fac, _, after = policy_change
+                patched_policies = dict(self.policies)
+                patched_policies[fac] = Policy(
+                    facility=fac,
+                    allow_generic=after["allow_generic"],
+                    require_public_reviewed=after[
+                        "require_public_reviewed"
+                    ],
+                    blocked=frozenset(
+                        Coord.parse(c) for c in after["blocked"]
+                    ),
+                )
+
+            draft_results = {}
+            for fac, target in scope:
+                payload = resolve(
+                    fac,
+                    target,
+                    self.candidates,
+                    patched_policies or self.policies,
+                    self.entries,
+                    entry_overrides=overrides,
+                )
+                draft_results[(fac, target.key())] = supply_signature(payload)
+
+            changed = {self._ekey(entry): entry for entry in plan}
+            conn = self._conn
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # If live state moved since the snapshot was computed, the
+                # baseline would be wrong; roll back and retake it.
+                if self._state_counter() != observed:
+                    conn.rollback()
+                    self._reload_live_state()
+                    continue
+                cur = conn.execute(
+                    "INSERT INTO review_draft (created_at, status, "
+                    "batch_detail) VALUES (?,?,?)",
+                    (
+                        datetime.now(timezone.utc).isoformat(),
+                        DRAFT_SAVED,
+                        json.dumps(
+                            self._batch_detail(batch), ensure_ascii=False
+                        ),
+                    ),
+                )
+                draft_id = cur.lastrowid
+                for key, entry in changed.items():
+                    conn.execute(
+                        "INSERT INTO review_draft_entry (draft_id, facility, "
+                        "lang, ctx, source_id, base_value, draft_value) "
+                        "VALUES (?,?,?,?,?,?,?)",
+                        (
+                            draft_id,
+                            entry.facility,
+                            entry.coord.lang,
+                            entry.coord.ctx,
+                            entry.source_id,
+                            None
+                            if key not in self.entries
+                            else json.dumps(
+                                entry_value(self.entries[key]), sort_keys=True
+                            ),
+                            json.dumps(entry_value(entry), sort_keys=True),
+                        ),
+                    )
+                if policy_change is not None:
+                    fac, before, after = policy_change
+                    conn.execute(
+                        "INSERT INTO review_draft_policy (draft_id, facility, "
+                        "base_value, draft_value) VALUES (?,?,?,?)",
+                        (
+                            draft_id,
+                            fac,
+                            json.dumps(before, sort_keys=True),
+                            json.dumps(after, sort_keys=True),
+                        ),
+                    )
+                for (fac, target_key), base_sig in base_signatures.items():
+                    conn.execute(
+                        "INSERT INTO review_draft_target (draft_id, facility, "
+                        "target_key, base_result, draft_result) "
+                        "VALUES (?,?,?,?,?)",
+                        (
+                            draft_id,
+                            fac,
+                            target_key,
+                            json.dumps(base_sig, sort_keys=True),
+                            json.dumps(
+                                draft_results[(fac, target_key)],
+                                sort_keys=True,
+                            ),
+                        ),
+                    )
+                # Saving a draft does not change live wording, so it must not
+                # advance the shared state token other connections watch.
+                conn.commit()
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            self._token = observed
+            return draft_id
+
+    def draft(self, draft_id: int) -> dict:
+        """Read one saved draft's immutable snapshot."""
+
+        row = self._conn.execute(
+            "SELECT draft_id, created_at, status, merged_at, merged_seq, "
+            "batch_detail FROM review_draft WHERE draft_id=?",
+            (draft_id,),
+        ).fetchone()
+        if row is None:
+            raise DraftNotFound(f"unknown draft: {draft_id}")
+        entries = [
+            {
+                "facility": fac,
+                "coord": Coord(lang, ctx).key(),
+                "source_id": sid,
+                "base_value": None if base is None else json.loads(base),
+                "draft_value": json.loads(draft),
+            }
+            for fac, lang, ctx, sid, base, draft in self._conn.execute(
+                "SELECT facility, lang, ctx, source_id, base_value, "
+                "draft_value FROM review_draft_entry WHERE draft_id=? "
+                "ORDER BY facility, lang, ctx, source_id",
+                (draft_id,),
+            )
+        ]
+        policy_rows = [
+            {
+                "facility": fac,
+                "base_value": json.loads(base),
+                "draft_value": json.loads(draft),
+            }
+            for fac, base, draft in self._conn.execute(
+                "SELECT facility, base_value, draft_value "
+                "FROM review_draft_policy WHERE draft_id=?",
+                (draft_id,),
+            )
+        ]
+        targets = [
+            {
+                "facility": fac,
+                "target": target_key,
+                "base_result": json.loads(base),
+                "draft_result": json.loads(draft),
+            }
+            for fac, target_key, base, draft in self._conn.execute(
+                "SELECT facility, target_key, base_result, draft_result "
+                "FROM review_draft_target WHERE draft_id=? "
+                "ORDER BY facility, target_key",
+                (draft_id,),
+            )
+        ]
+        return {
+            "draft_id": row[0],
+            "created_at": row[1],
+            "status": row[2],
+            "merged_at": row[3],
+            "merged_seq": row[4],
+            "batch": json.loads(row[5]),
+            "entries": entries,
+            "policy": policy_rows[0] if policy_rows else None,
+            "targets": targets,
+        }
+
+    def drafts(self) -> list[dict]:
+        """Ids and statuses of every saved draft, oldest first."""
+
+        return [
+            {
+                "draft_id": draft_id,
+                "created_at": created_at,
+                "status": status,
+                "merged_at": merged_at,
+                "merged_seq": seq,
+            }
+            for draft_id, created_at, status, merged_at, seq in self._conn
+            .execute(
+                "SELECT draft_id, created_at, status, merged_at, merged_seq "
+                "FROM review_draft ORDER BY draft_id"
+            )
+        ]
+
+    def merge_draft(self, draft_id: int) -> dict:
+        """Merge a saved draft into the live store, or reject without writes.
+
+        The approval is evaluated against the *current* live state, never by
+        replaying the draft's correction commands.  Records, the one policy
+        and every supply result the draft could affect are checked three
+        ways; a single disagreement raises :class:`MergeConflict` and the
+        live word supply, ledger and caches stay exactly as they were.
+        """
+
+        snapshot = self.draft(draft_id)
+        if snapshot["status"] == DRAFT_MERGED:
+            raise DraftAlreadyMerged(
+                f"draft {draft_id} was already merged at "
+                f"seq {snapshot['merged_seq']}; approve it again is a no-op"
+            )
+
+        # ``_merge_once`` decides against the current live state and then
+        # re-reads it inside the write transaction.  The approval decision
+        # and the applied result therefore belong to the same committed
+        # state: a correction committed between check and write forces the
+        # whole decision to be retaken rather than being overwritten.
+        return self._merge_once(draft_id, snapshot)
+
+    # -- internals ----------------------------------------------------------
+
+    def _merge_once(self, draft_id: int, snapshot: dict) -> dict:
+        if self._state_counter() != self._token:
+            # Another connection committed since our in-memory state was
+            # loaded; re-read before deciding anything.
+            self._reload_live_state()
+        while True:
+            observed = self._token
+            conflicts, _, plan, policy_change, scope, supply_report = (
+                self._evaluate_draft(snapshot)
+            )
+            if conflicts:
+                raise MergeConflict(
+                    draft_id, record_conflicts=conflicts
+                )
+            if supply_report:
+                raise MergeConflict(
+                    draft_id, supply_conflicts=supply_report
+                )
+
+            conn = self._conn
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Re-read inside the write lock.  In WAL mode this connection
+                # now observes the newest committed data; if another
+                # connection committed after the decision was taken, abandon
+                # this attempt, reload and take the whole decision again.
+                # The approved outcome and the decision therefore always
+                # belong to one committed state, and a correction committed
+                # after the check can never be overwritten by this merge.
+                if self._state_counter() != observed:
+                    conn.rollback()
+                    self._reload_live_state()
+                    continue
+                self._apply_in_transaction(plan, policy_change, scope)
+                # Choose the ledger slot from the ledger itself, inside the
+                # write lock, so a concurrent rejected batch cannot collide.
+                seq = conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 FROM batch_ledger"
+                ).fetchone()[0]
+                cur = conn.execute(
+                    "UPDATE review_draft SET status=?, merged_at=?, "
+                    "merged_seq=? WHERE draft_id=? AND status=?",
+                    (
+                        DRAFT_MERGED,
+                        datetime.now(timezone.utc).isoformat(),
+                        seq,
+                        draft_id,
+                        DRAFT_SAVED,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    # Another approver merged this draft first; this approval
+                    # must not write a second set of corrections.
+                    conn.rollback()
+                    self._reload_live_state()
+                    raise DraftAlreadyMerged(
+                        f"draft {draft_id} was merged concurrently"
+                    )
+                # Record the merge in the same finite batch ledger as direct
+                # corrections, so the commit token survives reopen and the
+                # approval is auditable alongside them.
+                conn.execute(
+                    "INSERT INTO batch_ledger (seq, status, applied_at, "
+                    "detail, error) VALUES (?,?,?,?,?)",
+                    (
+                        seq,
+                        "merged_draft",
+                        datetime.now(timezone.utc).isoformat(),
+                        json.dumps(
+                            {
+                                "draft_id": draft_id,
+                                "records": len(plan),
+                                "policy": policy_change.facility
+                                if policy_change is not None else None,
+                                "targets": sorted(
+                                    t.key() for _, t in scope
+                                ),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "",
+                    ),
+                )
+                conn.commit()
+            except DraftAlreadyMerged:
+                raise
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            self._seq = max(self._seq, seq)
+            self._token = self._state_counter()
+            return {
+                "draft_id": draft_id,
+                "status": DRAFT_MERGED,
+                "seq": seq,
+                "records": len(plan),
+                "policy": policy_change.facility
+                if policy_change is not None else None,
+                "targets": len(scope),
+                "supply": [],
+            }
+
+    def _evaluate_draft(self, snapshot):
+        """Three-way merge one draft against the live state.
+
+        Returns ``(record_conflicts, resolved_entries, plan, policy_change,
+        scope, supply_conflicts)``.  ``record_conflicts`` is a non-empty list
+        when any complete record or the policy disagrees; in that case no
+        supply check is attempted.  Otherwise ``supply_conflicts`` lists every
+        target whose expected result does not survive the merge.
+        """
+
+        # -- complete records ------------------------------------------------
+        record_conflicts = []
+        resolved_entries: dict[tuple[str, Coord, str], "Entry | None"] = {}
+        for item in snapshot["entries"]:
+            key = (
+                item["facility"],
+                Coord.parse(item["coord"]),
+                item["source_id"],
+            )
+            base = item["base_value"]
+            draft = item["draft_value"]
+            live = entry_value(self.entries.get(key))
+            merged, clash = merge_value(base, live, draft)
+            if clash:
+                record_conflicts.append(
+                    {
+                        "kind": "entry",
+                        "facility": item["facility"],
+                        "coord": item["coord"],
+                        "source_id": item["source_id"],
+                        "base": base,
+                        "draft": draft,
+                        "live": live,
+                    }
+                )
+            elif merged is not None:
+                resolved_entries[key] = self._entry_from_value(
+                    item["facility"], Coord.parse(item["coord"]),
+                    item["source_id"], merged,
+                )
+
+        # -- the single optional policy -------------------------------------
+        policy_change = None
+        policy_item = snapshot["policy"]
+        if policy_item is not None:
+            fac = policy_item["facility"]
+            base = policy_item["base_value"]
+            draft = policy_item["draft_value"]
+            live_policy = self.policies.get(fac)
+            live = None if live_policy is None else policy_value(live_policy)
+            merged, clash = merge_value(base, live, draft)
+            if clash:
+                record_conflicts.append(
+                    {
+                        "kind": "policy",
+                        "facility": fac,
+                        "base": base,
+                        "draft": draft,
+                        "live": live,
+                    }
+                )
+            elif merged is not None:
+                policy_change = PolicyCorrection(
+                    facility=fac,
+                    allow_generic=merged["allow_generic"],
+                    require_public_reviewed=merged[
+                        "require_public_reviewed"
+                    ],
+                    blocked=frozenset(
+                        Coord.parse(c) for c in merged["blocked"]
+                    ),
+                )
+
+        if record_conflicts:
+            return (
+                record_conflicts,
+                resolved_entries,
+                list(resolved_entries.values()),
+                policy_change,
+                set(),
+                [],
+            )
+
+        # -- supply check ---------------------------------------------------
+        plan = list(resolved_entries.values())
+        # Overlay just the merged records on live state; the unchanged entry
+        # table is shared rather than copied.
+        overrides = dict(resolved_entries)
+        policies_after = dict(self.policies)
+        if policy_change is not None:
+            pc = policy_change
+            policies_after[pc.facility] = Policy(
+                facility=pc.facility,
+                allow_generic=pc.allow_generic,
+                require_public_reviewed=pc.require_public_reviewed,
+                blocked=pc.blocked,
+            )
+
+        checked = self._supply_check_targets(snapshot)
+        # The merge writes exactly these targets, so the recompute scope is
+        # the checked set itself: no unrelated facility or chain is touched.
+        scope = set(checked)
+        supply_conflicts = []
+        for facility, target in sorted(
+            checked, key=lambda ft: (ft[0], ft[1].key())
+        ):
+            base_sig = supply_signature(self.query(facility, target))
+            live_sig = base_sig
+            merged_sig = supply_signature(
+                resolve(
+                    facility,
+                    target,
+                    self.candidates,
+                    policies_after,
+                    self.entries,
+                    entry_overrides=overrides,
+                )
+            )
+            recorded_base, draft_sig = _draft_signature(
+                snapshot, facility, target, base_sig
+            )
+            expected = expected_supply(recorded_base, draft_sig, live_sig)
+            if expected is None or merged_sig != expected:
+                supply_conflicts.append(
+                    {
+                        "facility": facility,
+                        "target": target.key(),
+                        "base": recorded_base,
+                        "draft": draft_sig,
+                        "live": live_sig,
+                        "merged": merged_sig,
+                        "expected": expected,
+                    }
+                )
+
+        return (
+            [],
+            resolved_entries,
+            plan,
+            policy_change,
+            scope,
+            supply_conflicts,
+        )
+
+    def _review_targets(self, changes, policy_facility):
+        """Every target whose wording a set of review changes can affect.
+
+        ``changes`` is an iterable of ``(facility, coord)`` pairs that the
+        draft really changes; ``policy_facility`` is the facility whose whole
+        policy changed, if any.  The scope follows the approval rules:
+
+        * an ordinary record -> only that facility's targets whose fixed
+          chain references the coordinate;
+        * a generic record -> every facility's targets that reference the
+          coordinate, even facilities the baseline policy forbids from using
+          generic words (they may be allowed by the time of approval);
+        * a policy -> every target that policy governs.
+
+        The index makes this proportional to the changed coordinates and the
+        targets that cite them, never to the whole library.
+        """
+
+        record_coords: set[Coord] = set()
+        generic_coords: set[Coord] = set()
+        for facility, coord in changes:
+            if facility == GENERIC:
+                generic_coords.add(coord)
+            else:
+                record_coords.add(coord)
+
+        record_facilities = {
+            facility for facility, _ in changes if facility != GENERIC
+        }
+        targets: set[tuple[str, Coord]] = set()
+        for fac in record_facilities:
+            for coord in record_coords:
+                for target in self._reverse.get(coord, ()):
+                    targets.add((fac, target))
+
+        if generic_coords:
+            for fac in self.policies:
+                for coord in generic_coords:
+                    for target in self._reverse.get(coord, ()):
+                        targets.add((fac, target))
+
+        if policy_facility is not None:
+            for target in self.candidates:
+                targets.add((policy_facility, target))
+
+        return targets
+
+    def _supply_check_targets(self, snapshot):
+        """Targets the merge must re-check, derived from the draft snapshot."""
+
+        changes = [
+            (item["facility"], Coord.parse(item["coord"]))
+            for item in snapshot["entries"]
+        ]
+        policy_facility = (
+            snapshot["policy"]["facility"]
+            if snapshot["policy"] is not None else None
+        )
+        return self._review_targets(changes, policy_facility)
+
+    @staticmethod
+    def _entry_from_value(facility, coord, source_id, value):
+        return Entry(
+            facility=facility,
+            coord=coord,
+            source_id=source_id,
+            body_state=value["body_state"],
+            text=value["text"],
+            is_public=bool(value["is_public"]),
+            review=value["review"],
+        )
+
+    def _reload_live_state(self):
+        """Drop in-memory caches after a failed write; re-read from SQLite."""
+
+        self.entries = {}
+        for fac, lang, ctx, sid, state, text, pub, rev in self._conn.execute(
+            "SELECT facility, lang, ctx, source_id, body_state, text, "
+            "is_public, review FROM entry_record"
+        ):
+            entry = Entry(
+                facility=fac,
+                coord=Coord(lang, ctx),
+                source_id=sid,
+                body_state=state,
+                text=text,
+                is_public=bool(pub),
+                review=rev,
+            )
+            self.entries[self._ekey(entry)] = entry
+        self.policies = {}
+        for facility, allow, req in self._conn.execute(
+            "SELECT facility, allow_generic, require_public_reviewed "
+            "FROM facility"
+        ):
+            blocked = frozenset(
+                Coord.parse(k)
+                for (k,) in self._conn.execute(
+                    "SELECT coord_key FROM blocked_coord WHERE facility=?",
+                    (facility,),
+                )
+            )
+            self.policies[facility] = Policy(
+                facility=facility,
+                allow_generic=bool(allow),
+                require_public_reviewed=bool(req),
+                blocked=blocked,
+            )
+        # Cached query results belong to the state we just discarded; re-read
+        # them too so readers on this connection never see a stale answer.
+        self.cache = {}
+        for fac, tk, payload in self._conn.execute(
+            "SELECT facility, target_key, payload FROM result_cache"
+        ):
+            self.cache[(fac, tk)] = json.loads(payload)
+        self.recomputes = {
+            (fac, tk): n
+            for fac, tk, n in self._conn.execute(
+                "SELECT facility, target_key, recomputes FROM recompute_stat"
+            )
+        }
+        self._token = self._state_counter()
+
+    def _ensure_fresh(self) -> None:
+        """Reload in-memory state if another connection committed since load."""
+
+        if self._state_counter() != self._token:
+            self._reload_live_state()
+
+    def _state_counter(self) -> int:
+        """Persistent live-state token shared by every connection.
+
+        It is advanced inside the same transaction as every accepted batch
+        and every draft merge, so two connections on the same file can tell
+        whether the wording they validated is still the wording on disk.
+        """
+
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'state_counter'"
+        ).fetchone()
+        return 0 if row is None else int(row[0])
+
     # ----------------------------------------------------------------- writes
 
     @staticmethod
@@ -625,19 +1408,32 @@ class TermStore:
             # Should not happen: rejected batches are logged in their own
             # transaction so a later failed BEGIN IMMEDIATE cannot roll them.
             conn.commit()
-        conn.execute("BEGIN")
-        conn.execute(
-            "INSERT INTO batch_ledger (seq, status, applied_at, detail, error) "
-            "VALUES (?,?,?,?,?)",
-            (
-                seq,
-                status,
-                datetime.now(timezone.utc).isoformat(),
-                json.dumps(detail, ensure_ascii=False),
-                error,
-            ),
-        )
-        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Another connection may have logged batches since ``seq`` was
+            # chosen; take the next free ledger slot rather than colliding.
+            actual = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM batch_ledger"
+            ).fetchone()[0]
+            if actual != seq:
+                seq = actual
+            conn.execute(
+                "INSERT INTO batch_ledger "
+                "(seq, status, applied_at, detail, error) VALUES (?,?,?,?,?)",
+                (
+                    seq,
+                    status,
+                    datetime.now(timezone.utc).isoformat(),
+                    json.dumps(detail, ensure_ascii=False),
+                    error,
+                ),
+            )
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        self._seq = max(self._seq, seq)
 
     @staticmethod
     def _batch_detail(batch: Batch) -> dict:

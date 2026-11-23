@@ -47,6 +47,7 @@ def resolve(
     candidate_lists: dict[Coord, list[Coord]],
     policies: dict[str, Policy],
     entries: dict[tuple[str, Coord, str], Entry],
+    entry_overrides: "dict | None" = None,
 ) -> dict:
     """Resolve one (facility, target language/context) query from scratch.
 
@@ -54,8 +55,15 @@ def resolve(
     winning text, the outcome kind, the whole fixed candidate range (with
     every coordinate and every source considered) and the reason each one
     did or did not qualify.
+
+    ``entry_overrides`` maps record keys to complete replacement records (or
+    ``None`` for a record absent from the hypothetical state).  It lets a
+    reviewer evaluate "the state after this small change" without copying
+    the whole entry table: only the override map is carried alongside the
+    unchanged records.
     """
 
+    overrides = entry_overrides or {}
     policy = policies[facility]
     candidates = candidate_lists[target]
 
@@ -69,9 +77,18 @@ def resolve(
     stopped_at = None
 
     # Entries are kept in a dict; group them once per coordinate to make the
-    # visit order explicit and independent of insertion order.
+    # visit order explicit and independent of insertion order.  Overrides are
+    # applied while scanning, so the unchanged table is never copied.
     by_coord: dict[Coord, list[Entry]] = {}
-    for entry in entries.values():
+    for key, entry in entries.items():
+        if key in overrides:
+            entry = overrides[key]
+        if entry is None:
+            continue
+        by_coord.setdefault(entry.coord, []).append(entry)
+    for key, entry in overrides.items():
+        if entry is None or key in entries:
+            continue
         by_coord.setdefault(entry.coord, []).append(entry)
     for bucket in by_coord.values():
         bucket.sort(key=lambda e: (e.facility, e.source_id))

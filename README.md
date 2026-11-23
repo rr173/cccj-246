@@ -142,26 +142,70 @@ print(ledger.report(0, 2 ** 62))
 详见 [docs/display-accounting.md](docs/display-accounting.md)，或用
 `python3 -I demo/ledger_demo.py` 看“迟到记录改变历史归属”的可复现示例。
 
+## 审稿草稿与合入审批（本地，不打断线上供数）
+
+译审员把一批设施术语更正交给同事审批时，线上词库仍会继续更新。
+`TermStore.save_draft` / `merge_draft` 在现有更正批次之上增加本地两步流程：
+
+```python
+draft_id = store.save_draft(Batch([
+    EntryCorrection("set_body", "pump-hall", Coord("zh", "tech"),
+                    "s10", text="泵-v2"),
+]))                                  # 线上供数不变，草稿可重开、不可改
+result = store.merge_draft(draft_id)  # 审批人之后按草稿编号合入
+```
+
+- **草稿**沿用现有批次的输入与校验规则，以同一个已提交状态为基线，保存
+  本批更正生效后的完整词条值、整份设施政策及各受影响目标的基线与草稿供数
+  结果；保存不改变线上供数、不写台账、不发布词包。
+- **审批用当时的线上状态**，绝不重放草稿里的编辑命令。每条完整词条与整份
+  政策三方合并：线上没改就采用草稿值，线上和草稿改成同一值就保留，双方相对
+  基线改成不同值记为**记录冲突**（指出词条键或政策设施及三方值）；区分
+  词条不存在、撤回和明确清空。
+- 即使没有记录冲突也**检查用词**（普通词按本设施引用该坐标的目标、通用词
+  按各设施引用该坐标的目标、政策按其管辖的全部目标），每个目标比较基线 /
+  仅草稿 / 当前线上 / 拟合入后的供数结果；只有一侧改结果则保留该侧，双方
+  改且不同或拟合入改变应保留结果即为**供数冲突**（指出目标及四个结果）。
+  出处证据变化本身不阻止合入。
+- 成功时词条、政策与查询结果同一事务生效，并持久记录草稿已合入；重复审批
+  已合入草稿不再写入。拒绝时线上词库逐字节不变，草稿仍可再次审批。
+- 审批依据与生效结果对应同一次线上状态：不同连接提交在线更正与审批时，
+  结果等同其中一个完整操作先完成，绝不覆盖核对后才发生的更正。
+- 保留原有直接更正、在线查询、词包同步与展示对账接口；批准草稿不自动发布
+  词包。重算只覆盖受影响目标，不复制整库、不逐个判定无依赖的设施或语境。
+
+```bash
+python3 -I demo/review_demo.py     # 可复现的保存/合入/冲突/供数危险示例
+python3 -I tests/fuzz_review.py    # 10 种子 × 100 轮随机草稿
+```
+
+详见 [docs/review-drafts.md](docs/review-drafts.md)。
+
 ## 目录
 
 ```
 termdb/
   model.py    领域模型与常量（词条身份、三态、政策、批次）
   engine.py   从零判定引擎（无缓存依赖，先资格后最高级出处）
-  store.py    SQLite 存储：原子批次、局部重算、台账、重开
+  store.py    SQLite 存储：原子批次、局部重算、台账、重开、审稿草稿
+  review.py   审稿草稿的三方合并与供数比较规则
   sync.py     离线词包：发布端快照、分页下载、差量、设备原子安装
   ledger.py   展示次数对账：修订合并、区间归属、增量维护、报表
 tests/
   oracle.py          独立从零重写的参考判定器（不导入 engine）
   test_termdb.py     17 个端到端/边界/回归测试
   fuzz_scopes.py     随机差分模糊：每批后全量对照 oracle 并核对重算范围
+  test_review.py     31 个草稿保存/合入/并发测试
+  fuzz_review.py     10 种子 × 100 轮随机草稿，全量对照独立重算
   test_sync.py       42 个离线同步端到端测试
   fuzz_sync.py       10 种子 × 60 轮随机同步模糊
   test_ledger.py     33 个对账库端到端/边界/回归测试
   fuzz_ledger.py     12 种子 × 120 轮随机对账，全量对照独立重算
 demo/demo.py         可运行的小参考，串联题目点名的五类核对
+demo/review_demo.py  可复现的审稿草稿保存与合入示例
 demo/sync_demo.py    可复现的离线词包同步示例
 demo/ledger_demo.py  可复现的迟到记录改变历史归属示例
+docs/review-drafts.md 草稿规则、合入判定、并发语义与本地示例
 docs/offline-sync.md 离线同步协议、本地使用方式与可复现示例
 docs/display-accounting.md 对账库规则、增量维护、使用方式与示例
 ```
@@ -169,11 +213,13 @@ docs/display-accounting.md 对账库规则、增量维护、使用方式与示�
 ## 运行
 
 ```bash
-python3 -I -m unittest discover -s tests -v   # 92 个测试
+python3 -I -m unittest discover -s tests -v   # 123 个测试
 python3 -I tests/fuzz_scopes.py              # 12 种子 × 400 随机批次
+python3 -I tests/fuzz_review.py              # 10 种子 × 100 随机草稿轮
 python3 -I tests/fuzz_sync.py                # 10 种子 × 60 随机同步轮
 python3 -I tests/fuzz_ledger.py              # 12 种子 × 120 随机对账轮
 python3 -I demo/demo.py                      # 端到端小参考
+python3 -I demo/review_demo.py               # 审稿草稿保存与合入示例
 python3 -I demo/sync_demo.py                 # 离线词包同步示例
 python3 -I demo/ledger_demo.py               # 迟到记录改变归属示例
 ```

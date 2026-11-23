@@ -155,7 +155,7 @@ python3 -I demo/ledger_demo.py /tmp/keep  # 保留 SQLite 以便检查
 不接触发布端或页面。原有测试与示例照常运行。
 
 ```bash
-python3 -I -m unittest discover -s tests -v   # 92 个测试
+python3 -I -m unittest discover -s tests -v   # 123 个测试
 python3 -I tests/fuzz_ledger.py               # 12 种子 × 120 轮随机对账
 python3 -I demo/ledger_demo.py                # 迟到记录改变归属示例
 ```

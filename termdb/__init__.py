@@ -39,6 +39,14 @@ from .ledger import (
     identity_from_device,
 )
 from .store import TermStore
+from .review import (
+    DRAFT_MERGED,
+    DRAFT_SAVED,
+    DraftAlreadyMerged,
+    DraftError,
+    DraftNotFound,
+    MergeConflict,
+)
 from .sync import (
     KEEP_VERSIONS,
     PAGE_LIMIT,
@@ -59,6 +67,11 @@ __all__ = [
     "CROSS_VERSION",
     "Coord",
     "CountLedger",
+    "DRAFT_MERGED",
+    "DRAFT_SAVED",
+    "DraftAlreadyMerged",
+    "DraftError",
+    "DraftNotFound",
     "Entry",
     "EntryCorrection",
     "EntryKey",
@@ -70,6 +83,7 @@ __all__ = [
     "KEEP_VERSIONS",
     "LedgerBatch",
     "LedgerError",
+    "MergeConflict",
     "NO_AVAILABLE",
     "OfflinePublisher",
     "PAGE_LIMIT",
